@@ -33,10 +33,19 @@ func newApp(ctx context.Context) (*app, error) {
 	log := cfg.NewLogger(os.Stderr)
 	slog.SetDefault(log)
 
-	db, err := store.NewPostgres(ctx, cfg.DatabaseURL)
+	db, err := store.NewPostgres(ctx, cfg.DatabaseURL, store.PoolOptions{
+		MaxConns: cfg.DatabaseMaxConns,
+		MinConns: cfg.DatabaseMinConns,
+	})
 	if err != nil {
 		return nil, err
 	}
+
+	// The pool in force is not always the one that was configured: pgx has
+	// defaults of its own, and the connection string can carry a size too.
+	// Logging the resolved numbers says which the process actually got.
+	pool := db.PoolConfig()
+	log.Info("database pool ready", "max_conns", pool.MaxConns, "min_conns", pool.MinConns)
 
 	fetcher := stellar.NewRPCFetcher(cfg.RPCURL, nil)
 
@@ -83,6 +92,27 @@ func withApp(ctx context.Context, fn func(context.Context, *app) error) error {
 // fetchContext bounds a single contract fetch by the configured timeout.
 func (a *app) fetchContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(ctx, a.cfg.RPCTimeout)
+}
+
+// withStore runs fn against the database alone. Commands that only move
+// registry data between stores use it so they cannot accidentally depend on
+// RPC: export and import must work during an outage.
+func withStore(ctx context.Context, fn func(context.Context, store.Store) error) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+
+	db, err := store.NewPostgres(ctx, cfg.DatabaseURL, store.PoolOptions{
+		MaxConns: cfg.DatabaseMaxConns,
+		MinConns: cfg.DatabaseMinConns,
+	})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = db.Close() }()
+
+	return fn(ctx, db)
 }
 
 // requireDatabaseURL produces the same guidance as config.Load for commands

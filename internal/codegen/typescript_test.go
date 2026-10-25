@@ -5,6 +5,7 @@ import (
 	"flag"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -15,7 +16,7 @@ import (
 	"github.com/soroworks/sorovault/internal/model"
 )
 
-var update = flag.Bool("update", false, "rewrite the golden TypeScript client")
+var update = flag.Bool("update", false, "rewrite the golden files")
 
 func ptr(t model.Type) *model.Type { return &t }
 
@@ -42,12 +43,156 @@ func TestGoldenZKVote(t *testing.T) {
 
 	golden := filepath.Join("testdata", "zkvote.client.ts")
 	if *update {
-		require.NoError(t, os.WriteFile(golden, []byte(got), 0o644))
+		require.NoError(t, os.WriteFile(golden, []byte(got), 0o600))
 		t.Logf("wrote %s", golden)
 	}
-	want, err := os.ReadFile(golden)
+	want, err := os.ReadFile(golden) //nolint:gosec // test-owned golden path
 	require.NoError(t, err, "golden file missing; regenerate with -update")
 	assert.Equal(t, string(want), got, "generated client changed; if intended, rerun with -update")
+}
+
+// TestZodFlavour proves the only difference between the plain client and
+// the schema-carrying one is what runtime validation needs: the zod import
+// in the header, the schemas section at the end, and the staleness guard
+// both flavours share.
+func TestZodFlavour(t *testing.T) {
+	t.Parallel()
+
+	raw, err := os.ReadFile("../spec/testdata/zkvote.golden.json")
+	require.NoError(t, err)
+	var iface model.Interface
+	require.NoError(t, json.Unmarshal(raw, &iface))
+
+	plain, err := codegen.TypeScript(&iface, src)
+	require.NoError(t, err)
+	zodSrc := src
+	zodSrc.WithZod = true
+	got, err := codegen.TypeScript(&iface, zodSrc)
+	require.NoError(t, err)
+
+	assert.Contains(t, got, `import { z } from "zod";`)
+	assert.NotContains(t, plain, `import { z } from "zod";`, "the plain flavour stays zod-free")
+	assert.Contains(t, got, "export const ProposalSchema = z.object({")
+	assert.Contains(t, got, "vote_params: z.lazy(() => VoteParamsSchema),", "cross-references are deferred so recursive interfaces stay legal")
+	assert.Contains(t, got, "export const voteArgsSchema = z.object({")
+	assert.NotContains(t, got, "ErrorSchema", "an error enum is its numeric code, not a schema")
+	assert.Contains(t, got, "export function assertSameWasm(liveHash: string): boolean {", "both flavours carry the staleness guard")
+}
+
+// TestZodMappings pins the schema expression for every scalar kind, so the
+// widths cannot silently drift from the TypeScript types the same
+// generator emits.
+func TestZodMappings(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		kind model.Type
+		want string
+	}{
+		{model.Type{Kind: model.KindU32}, "z.number().int().min(0).max(4294967295)"},
+		{model.Type{Kind: model.KindI32}, "z.number().int().min(-2147483648).max(2147483647)"},
+		{model.Type{Kind: model.KindU64}, "z.bigint().min(0n).max((1n << 64n) - 1n)"},
+		{model.Type{Kind: model.KindI64}, "z.bigint().min(-(1n << 63n)).max((1n << 63n) - 1n)"},
+		{model.Type{Kind: model.KindU128}, "z.bigint().min(0n).max((1n << 128n) - 1n)"},
+		{model.Type{Kind: model.KindI256}, "z.bigint().min(-(1n << 255n)).max((1n << 255n) - 1n)"},
+		{model.Type{Kind: model.KindTimepoint}, "z.bigint().min(0n).max((1n << 64n) - 1n)"},
+		{model.Type{Kind: model.KindBytesN, N: 32}, "z.custom<Buffer>((v) => Buffer.isBuffer(v) && v.length === 32)"},
+		{model.Type{Kind: model.KindBytes}, "z.custom<Buffer>((v) => Buffer.isBuffer(v))"},
+		{model.Type{Kind: model.KindAddress}, "z.string().regex(/^[CG][A-Z2-7]{55}$/, \"not a Stellar address\")"},
+		{model.Type{Kind: model.KindMuxedAddress}, "z.string().regex(/^[CM][A-Z2-7]{55}$/, \"not a Stellar muxed address\")"},
+	} {
+		got, err := codegen.TypeScript(&model.Interface{
+			Functions: []model.Function{{
+				Name:   "probe",
+				Inputs: []model.Param{{Name: "v", Type: tc.kind}},
+			}},
+		}, codegen.Source{WithZod: true})
+		require.NoError(t, err)
+		assert.Contains(t, got, "v: "+tc.want+",", tc.kind.Display)
+	}
+}
+
+// TestZodShapes pins the section's decisions beyond plain objects: how a
+// union, an enum and a recursive reference render, and which name yields
+// when a function and a type want the same schema constant.
+func TestZodShapes(t *testing.T) {
+	t.Parallel()
+
+	iface := &model.Interface{
+		Types: model.Types{
+			Structs: []model.Struct{
+				{Name: "voteArgs", Fields: []model.StructField{{Name: "n", Type: model.Type{Kind: model.KindU32}}}},
+				{
+					Name:   "forest",
+					Fields: []model.StructField{{Name: "children", Type: model.Type{Kind: model.KindVec, Element: ptr(model.Type{Kind: model.KindUDT, Name: "forest"})}}},
+				},
+			},
+			Unions: []model.Union{
+				{
+					Name: "shape",
+					Cases: []model.UnionCase{
+						{Name: "unit"},
+						{Name: "sized", Values: []model.Type{{Kind: model.KindU32}}},
+					},
+				},
+				{Name: "empty"},
+			},
+			Enums: []model.Enum{
+				{Name: "phase", Cases: []model.EnumCase{{Name: "open", Value: 1}, {Name: "closed", Value: 2}}},
+			},
+			ErrorEnums: []model.ErrorEnum{
+				{Name: "fault", Cases: []model.EnumCase{{Name: "no", Value: 1}}},
+			},
+		},
+		Functions: []model.Function{{Name: "vote", Inputs: []model.Param{{Name: "x", Type: model.Type{Kind: model.KindU32}}}}},
+	}
+	got, err := codegen.TypeScript(iface, codegen.Source{WithZod: true})
+	require.NoError(t, err)
+
+	assert.Contains(t, got, "export const phaseSchema = z.nativeEnum(phase);")
+	assert.Contains(t, got, "export const shapeSchema = z.union([")
+	assert.Contains(t, got, `  z.object({ tag: z.literal("unit"), values: z.undefined() }),`)
+	assert.Contains(t, got, `  z.object({ tag: z.literal("sized"), values: z.tuple([z.number().int().min(0).max(4294967295)]) }),`)
+	assert.Contains(t, got, "export const emptySchema = z.never();")
+	// A recursive interface keeps working: the self-reference is deferred
+	// to validation time.
+	assert.Contains(t, got, "children: z.array(z.lazy(() => forestSchema)),")
+	// The struct claimed voteArgsSchema first, so the function's constant
+	// yields — the same convention the type declarations use.
+	assert.Contains(t, got, "export const voteArgsSchema_ = z.object({")
+	assert.NotContains(t, got, "faultSchema", "an error enum is its numeric code, not a schema")
+}
+
+// TestGoldenPackage generates the npm package built around the golden client
+// and compares it with the checked-in files. CI runs npm install and npm run
+// build in that directory, so the package is known to build from scratch,
+// not merely to be stable.
+func TestGoldenPackage(t *testing.T) {
+	t.Parallel()
+
+	raw, err := os.ReadFile("../spec/testdata/zkvote.golden.json")
+	require.NoError(t, err)
+	var iface model.Interface
+	require.NoError(t, json.Unmarshal(raw, &iface))
+
+	files, err := codegen.Package(&iface, src, codegen.PackageOptions{Name: "zkvote-client", WithZod: true})
+	require.NoError(t, err)
+
+	dir := filepath.Join("testdata", "zkvote-pkg")
+	if *update {
+		for _, file := range files {
+			path := filepath.Join(dir, filepath.FromSlash(file.Path))
+			require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o750))
+			require.NoError(t, os.WriteFile(path, file.Data, 0o600))
+		}
+	}
+
+	for _, file := range files {
+		want, err := os.ReadFile(filepath.Join(dir, filepath.FromSlash(file.Path))) //nolint:gosec // paths come from the generator, not the caller
+		require.NoErrorf(t, err, "%s is missing; regenerate with -update", file.Path)
+		assert.Equal(t, string(want), string(file.Data),
+			"%s changed; if intended, rerun with -update", file.Path)
+	}
 }
 
 func TestTypeMapping(t *testing.T) {
@@ -143,11 +288,68 @@ func TestRejectsConflictingErrorCodes(t *testing.T) {
 	assert.ErrorContains(t, err, "error code 1")
 }
 
-func TestRejectsInvalidFunctionName(t *testing.T) {
+func TestQuotesInvalidFunctionName(t *testing.T) {
 	t.Parallel()
 	iface := &model.Interface{Functions: []model.Function{{Name: "not-valid"}}}
-	_, err := codegen.TypeScript(iface, src)
-	assert.ErrorContains(t, err, "not a valid identifier")
+	got, err := codegen.TypeScript(iface, src)
+	require.NoError(t, err)
+	assert.Contains(t, got, `  "not-valid"(options?: sdk.MethodOptions):`)
+}
+
+func FuzzTypeScript(f *testing.F) {
+	f.Add("Config", "fee-bps", "doc with */ terminator", []byte{0, 1, 2})
+	f.Add("class", "quoted\"name", "multiline\ndoc", []byte{3, 4, 5})
+	f.Add("bad-name", "", "", []byte{})
+
+	f.Fuzz(func(t *testing.T, name, fieldName, doc string, shapes []byte) {
+		types := []model.Type{
+			model.Scalar(model.KindBool),
+			model.Scalar(model.KindU32),
+			model.Scalar(model.KindString),
+			{Kind: model.KindOption, Inner: ptr(model.Scalar(model.KindI64))},
+			{Kind: model.KindVec, Element: ptr(model.Scalar(model.KindAddress))},
+			{Kind: model.KindMap, Key: ptr(model.Scalar(model.KindSymbol)), Value: ptr(model.Scalar(model.KindU128))},
+			{Kind: model.KindTuple, Elements: []model.Type{model.Scalar(model.KindBool), model.Scalar(model.KindBytes)}},
+		}
+		shapeAt := func(index int) model.Type {
+			if len(shapes) == 0 {
+				return types[0]
+			}
+			return types[int(shapes[index%len(shapes)])%len(types)]
+		}
+
+		iface := &model.Interface{
+			Types: model.Types{Structs: []model.Struct{{Name: name, Doc: doc, Fields: []model.StructField{{
+				Name: fieldName, Doc: doc, Type: shapeAt(0),
+			}}}}},
+			Functions: []model.Function{{Name: name, Doc: doc, Inputs: []model.Param{{
+				Name: fieldName, Type: shapeAt(1),
+			}}}},
+		}
+
+		got, err := codegen.TypeScript(iface, src)
+		require.NoError(t, err)
+
+		declaredNames := regexp.MustCompile(`(?m)^export (?:interface|type|enum) ([^\s{=]+)`)
+		for _, match := range declaredNames.FindAllStringSubmatch(got, -1) {
+			assert.Regexp(t, `^[A-Za-z_$][A-Za-z0-9_$]*$`, match[1])
+		}
+
+		inDoc := false
+		for _, line := range strings.Split(got, "\n") {
+			if strings.Contains(line, "/**") {
+				inDoc = true
+				continue
+			}
+			if inDoc {
+				if strings.TrimSpace(line) == "*/" {
+					inDoc = false
+					continue
+				}
+				assert.NotContains(t, line, "*/")
+			}
+		}
+	})
 }
 
 func TestOutputIsDeterministic(t *testing.T) {
@@ -197,4 +399,40 @@ func TestMarkdownDocumentsInterface(t *testing.T) {
 	} {
 		assert.Contains(t, got, want)
 	}
+}
+
+func TestTypeScriptParameterDocumentation(t *testing.T) {
+	t.Parallel()
+	iface := &model.Interface{
+		Types: model.Types{Structs: []model.Struct{{
+			Name: "Config",
+			Fields: []model.StructField{{
+				Name: "threshold", Doc: "Minimum required */ threshold.", Type: model.Scalar(model.KindU32),
+			}},
+		}}},
+		Functions: []model.Function{
+			{Name: "transfer", Doc: "Transfer tokens.", Inputs: []model.Param{
+				{Name: "to", Doc: "Recipient address.", Type: model.Scalar(model.KindAddress)},
+				{Name: "amount", Doc: "Amount in stroops. */ Keep exact.\nSecond line.", Type: model.Scalar(model.KindI128)},
+				{Name: "memo", Type: model.Scalar(model.KindString)},
+			}},
+			{Name: "set_threshold", Inputs: []model.Param{
+				{Name: "threshold", Doc: "Minimum required.", Type: model.Scalar(model.KindU32)},
+			}},
+		},
+	}
+	got, err := codegen.TypeScript(iface, src)
+	require.NoError(t, err)
+	for _, want := range []string{
+		" * Transfer tokens.",
+		" * @param args.to Recipient address.",
+		" * @param args.amount Amount in stroops. *\\/ Keep exact.",
+		" * Second line.",
+		" * @param args.threshold Minimum required.",
+		"  /**\n   * Minimum required *\\/ threshold.\n   */\n  threshold: sdk.u32;",
+	} {
+		assert.Contains(t, got, want)
+	}
+	assert.NotContains(t, got, "@param args.memo", "undocumented parameters should not emit tags")
+	assert.NotContains(t, got, " * @param args.amount Amount in stroops. */", "parameter docs must escape comment terminators")
 }
